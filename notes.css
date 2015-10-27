@@ -1,0 +1,26 @@
+body {
+    color: #ddd;
+    background-color: #333;
+    font-size: 12px;
+}
+
+div.notes {
+    margin: 1rem;
+    padding: 1rem;
+    background-color: #444;
+    font-size: 14px;
+}
+
+pre.src {
+    box-shadow: none;
+    border: none;
+}
+
+.outline-2, .outline-3 {
+    page-break-inside: avoid;
+    page-break-before: auto;
+}
+
+a {
+    color: #def;
+}

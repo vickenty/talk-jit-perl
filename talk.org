@@ -1,0 +1,530 @@
+* JIT compiler in Perl
+  Vikentiy Fesunov
+
+  #+INCLUDE: email.txt
+
+  github.com/vickenty
+
+#+STARTUP: overview hideblocks
+#+OPTIONS: num:nil toc:nil reveal_history:t reveal_title_slide:nil reveal_notes:t
+#+REVEAL_ROOT: node_modules/reveal.js
+#+REVEAL_THEME: black
+#+REVEAL_TRANS: fade
+#+REVEAL_EXTRA_CSS: talk.css
+#+REVEAL_MARGIN: 0.0
+#+HTML_HEAD: <link rel="stylesheet" href="notes.css"/>
+#+BEGIN_src elisp :exports none
+  (org-export-define-derived-backend 'html-notes 'html
+    :export-block '("NOTES")
+    :translate-alist
+    '((export-block . (lambda (el contents info)
+                        (if (string= (org-element-property :type el) "NOTES")
+                            (format "<div class=\"notes\">%s</div>"
+                                    (org-export-string-as
+                                     (org-element-property :value el)
+                                     'html
+                                     t)))))))
+  (org-export-to-buffer 'html-notes "*Org Notes Export*")
+#+END_src
+# Local Variables:
+# org-html-postamble: nil
+# End:
+* Disclaimer
+  This talk is not about making perl faster or code performance in general.
+  #+BEGIN_NOTES
+  No benchmarks.
+  #+END_NOTES
+* What is a JIT compiler
+  "Just-in-time" compiler generates machine code during program execution,
+  right before it will be used.
+  #+BEGIN_NOTES
+  Just to be clear.
+  #+END_NOTES
+* COMMENT Previous work
+  * Inline::C
+  * XS::TCC
+  * C::Blocks
+  * FFI::TinyCC
+  #+BEGIN_NOTES
+  Not a new idea.
+  #+END_NOTES
+* GCCJIT
+  * A library to generate native machine code
+  * New, first released with GCC 5.1 in April '15
+  * Simple C API
+  #+BEGIN_NOTES
+  Some time ago I stumbled on a new library called GCCJIT.
+
+  It provides an API to GCC compiler backend, allowing programmer to
+  dynamically build functions, compile them and execute resulting
+  machine code right away.
+
+  Its well structured and relatively simple C API makes itvery easy to
+  use it from Perl.
+  #+END_NOTES
+* Example 1
+  #+BEGIN_SRC c
+    int square(int param) {
+      return param * param;
+    }
+  #+END_SRC
+  implemented using GCCJIT 
+  #+BEGIN_NOTES
+  As an example, a simple function implemented using GCCJIT's Perl bindings.
+  #+END_NOTES
+** Ex1: prepare
+   #+BEGIN_src perl -n :tangle ex1.pl
+     use strict;
+     use warnings;
+     use GCCJIT::Context;
+     use GCCJIT qw/:all/;
+
+     my $ctx = GCCJIT::Context->acquire();
+
+     my $int_type = $ctx->get_type(GCC_JIT_TYPE_INT);
+   #+END_src
+   #+BEGIN_NOTES
+   First we need to create a GCCJIT context. It represents the compiler state and is the main entry point for the library.
+   Next, we get an object that represents a simple integer type.
+   #+END_NOTES
+** Ex1: define function
+   #+BEGIN_src perl +n :tangle ex1.pl
+     my $param = $ctx->new_param(undef, $int_type, "param");
+     my $fn = $ctx->new_function(undef, GCC_JIT_FUNCTION_EXPORTED,
+         $int_type, "square", [ $param ],
+         0,
+     );
+   #+END_src
+   #+BEGIN_NOTES
+   To create a function, first we create an object for each of it's parameters using =new_param=.
+   Next we create the function object itself by calling =new_function=, passing the return type, name, and an array of function parameters.
+   #+END_NOTES
+** Ex1: do the math
+   #+BEGIN_SRC perl +n :tangle ex1.pl
+     my $rvalue = $ctx->new_binary_op(undef,
+         GCC_JIT_BINARY_OP_MULT,
+         $int_type,
+         $param->as_rvalue(),
+         $param->as_rvalue(),
+     );   
+   #+END_SRC
+   #+BEGIN_NOTES
+   Next, we create multiplication operation by calling =new_binary_op=.
+   #+END_NOTES
+** Ex1: return
+   #+BEGIN_SRC perl +n :tangle ex1.pl
+     my $block = $fn->new_block("my block");
+     $block->end_with_return(undef, $rvalue);
+   #+END_src
+   #+BEGIN_NOTES
+   All functions in GCCJIT must have at least one block. Blocks are
+   used by GCCJIT to implement flow control, like conditionals and
+   loops. Here we create one block and configure it to result of
+   multiplication operation.
+   #+END_NOTES
+** Ex1: compile and call
+   #+BEGIN_src perl +n :tangle ex1.pl
+     my $result = $ctx->compile;
+     my $ptr = $result->get_code("square");
+
+     use FFI::Raw;
+     use feature "say";
+
+     my $ffi = FFI::Raw->new_from_ptr(
+         $ptr, FFI::Raw::int, FFI::Raw::int
+     )->coderef;
+
+     say $ffi->(4);
+   #+END_src
+   #+BEGIN_NOTES
+   That's it. Now we compile the context and get the pointer to the native function we just compiled.
+   To call it, we need to use FFI::Raw, because the function uses standard calling convention for the machine code.
+   #+END_NOTES
+   #+BEGIN_src perl +n :tangle ex1.pl :exports none
+     { no warnings; push @{$main::stash}, $result; $ffi }
+   #+END_src
+* Without FFI::Raw
+  #+BEGIN_NOTES
+  FFI stands for "foreign function interface", interface to functions
+  defined outside of our language. Can we make native Perl functions?
+  #+END_NOTES
+** XS
+   A system to write Perl packages in C
+   #+BEGIN_SRC c
+     int
+     square(int param)
+     CODE:
+             RETVAL = param * param;
+     OUTPUT:
+             RETVAL   
+   #+END_SRC
+   #+BEGIN_NOTES
+   Perl has XS, a system that allows one to write Perl packages in
+   C. Such packages are just shared libraries that follow a specific
+   set of conventions set by Perl.
+   #+END_NOTES
+** Generate compatible code?
+   #+ATTR_REVEAL: :frag none
+   #+BEGIN_SRC c
+     static void XS_Square_square(PerlInterpreter* my_perl __attribute__((unused)), CV* cv __attribute__((unused)));
+     static void XS_Square_square(PerlInterpreter* my_perl __attribute__((unused)), CV* cv __attribute__((unused)))
+     {
+         extern int Perl___notused(void); SV **sp = (my_perl->Istack_sp); I32 ax = (*(my_perl->Imarkstack_ptr)--); SV **mark = (my_perl->Istack_base) + ax++; I32 items = (I32)(sp - mark);
+         if (items != 1)
+            Perl_croak_xs_usage(cv, "param");
+         {
+      int RETVAL;
+      SV * const targ = (((my_perl->Iop)->op_private & 4) ? ((my_perl->Icurpad)[(my_perl->Iop)->op_targ]) : Perl_sv_newmortal(my_perl));
+      int param = (int)(((((my_perl->Istack_base)[ax + (0)])->sv_flags & (0x00000100|0x00200000)) == 0x00000100) ? ((XPVIV*) ((my_perl->Istack_base)[ax + (0)])->sv_any)->xiv_u.xivu_iv : Perl_sv_2iv_flags(my_perl, (my_perl->Istack_base)[ax + (0)],2))
+     ;
+     # 11 "Square.xs"
+      RETVAL = param * param;
+     # 173 "Square.c"
+      (sp = (my_perl->Istack_base) + ax - 1); (void)( { Perl_sv_setiv(my_perl, targ,(IV)((IV)RETVAL)); (void)( { (void)( { if (__builtin_expect(((((targ)->sv_flags & 0x00400000)) ? (_Bool)1 : (_Bool)0),(0))) Perl_mg_set(my_perl, targ); } ); (*++sp = (targ)); } ); } );
+         }
+         (void)( { const IV tmpXSoff = (1); (my_perl->Istack_sp) = (my_perl->Istack_base) + ax + (tmpXSoff - 1); return; } );
+     }
+   #+END_SRC
+   #+BEGIN_NOTES
+   And if C compiler can do it, in theory we should be able too.
+   
+   (CUE) But this is what C compiler gets after XS does its magic.
+
+   XS is very C centric, implemented as C macros, so the code that C
+   compiler has to produce to be compatible with Perl is very
+   complicated.
+   #+END_NOTES
+** Real XS interface
+   #+BEGIN_SRC c
+     static void XS_Square_square(PerlInterpreter* my_perl, CV* cv);
+   #+END_SRC
+   All you get is a pointer to the entire interpreter state
+   #+BEGIN_NOTES
+   The important bit from last slide is this. This is the interface
+   all XS functions have.
+
+   All you get is just a pointer to the entire state of the perl
+   interpreter. Somewhere inside it there is a stack with your
+   arguments somewhre on it.
+
+   Even internally perl is defined using C macros and implementing XS
+   for another language or for a JIT compiler would require a fair
+   deal of reverse engineering. Not to say that implementation changes
+   from one version of perl to another.
+   #+END_NOTES
+* Ouroboros
+  A bridge to perl internals for machine code
+  #+BEGIN_NOTES
+  There is a way out. I made a small library that...
+  #+END_NOTES
+** Uses macros to turn Perl macros into C functions
+   #+BEGIN_SRC c
+     void ouroboros_stack_init(pTHX_ ouroboros_stack_t stack) {
+             dXSARGS;
+             stack->sp = sp;
+             stack->mark = mark;
+             stack->ax = ax;
+             stack->items = items;
+     }
+
+     #define sp (stack->sp)
+     #define mark (stack->mark)
+     #define ax (stack->ax)
+     #define items (stack->items)
+
+     SV* ouroboros_stack_fetch(pTHX_ ouroboros_stack_t stack, unsigned int item) {
+             return ST(item);
+     }
+
+     void ouroboros_stack_prepush(pTHX_ ouroboros_stack_t stack)
+     {
+             XSprePUSH;
+     }
+     // etc, etc
+   #+END_SRC
+   #+BEGIN_NOTES
+   ...puts each XS macro in a separate C function. dXSARGS defines
+   local variables in each XS function, so I copy them into a
+   structure, pass it around, and use my own macros to trick XS into
+   using it instead of local variables.
+   #+END_NOTES
+** Exports pointers to these functions into Perl 
+   #+BEGIN_src c
+     void*
+     ouroboros_stack_init_ptr()
+     CODE:
+             RETVAL = ouroboros_stack_init;
+     OUTPUT:
+             RETVAL
+   #+END_src
+   #+BEGIN_NOTES
+   To call a function from JIT'ed code we need to know it's
+   address. On the Perl side, Ouroboros exports addresses of the
+   functions defined earlier, so they can be used in the generated
+   code.
+   #+END_NOTES
+** Bonus
+   Write extensions in better languages than C
+
+   For example Rust:
+   #+BEGIN_SRC rust -n
+     pub extern fn rusty_hello(perl: &mut Interp, cv: &CV) {
+         let mut xs = XS::init(perl, cv);
+         xs.prepush();
+         xs.push_string("Hello from Rust!");
+         xs.putback();
+     }
+   #+END_SRC
+   #+BEGIN_NOTES
+   This also brings Perl closer to other languages that can use C libraries. This is an example in Rust.
+   #+END_NOTES
+* Example 2
+  #+BEGIN_SRC c
+    int
+    square(int param)
+    CODE:
+            RETVAL = param * param;
+    OUTPUT:
+            RETVAL
+  #+END_SRC
+  implemented using GCCJIT and Ouroboros
+  #+BEGIN_NOTES
+  The same square function, this time accepting parameters from Perl directly.
+
+  This example contains a lot of GCCJIT-specific boilerplate.
+  #+END_NOTES
+** Ex2: prepare
+   #+BEGIN_src perl -n :tangle ex2.pl
+     use strict;
+     use warnings;
+     use GCCJIT::Context;
+     use GCCJIT qw/:all/;
+     use Ouroboros qw/:all/;
+
+     my $ctx = GCCJIT::Context->acquire();
+   #+END_src
+   #+BEGIN_NOTES
+   As before, we start by creating a GCCJIT context.
+   #+END_NOTES
+** Ex2: create types
+   #+BEGIN_src perl +n :tangle ex2.pl
+     my $int_type = $ctx->get_type(GCC_JIT_TYPE_INT);
+     my $void_type = $ctx->get_type(GCC_JIT_TYPE_VOID);
+     my $void_ptr_type = $ctx->get_type(GCC_JIT_TYPE_VOID_PTR);
+
+     my $stack_type = $ctx->new_struct_type(undef, "ouroboros_stack", [
+         $ctx->new_field(undef, $void_ptr_type, "sp"),
+         $ctx->new_field(undef, $void_ptr_type, "mark"),
+         $ctx->new_field(undef, $int_type, "ax"),
+         $ctx->new_field(undef, $int_type, "items"),
+     ])->as_type();
+   #+END_src
+   #+BEGIN_NOTES
+   But we will need a lot more types this time.
+   
+   In addition to primitive types we define a structure to be used by
+   Ouroboros. We won't be using its fields, but we could if we wanted.
+   #+END_NOTES
+** Ex2: define function types for Ouroboros
+   #+BEGIN_src perl +n :tangle ex2.pl
+     my $stack_op_type = $ctx->new_function_ptr_type(undef,
+         $void_type, [ $void_ptr_type, $void_ptr_type ], 0);
+
+     my $stack_op_int_type = $ctx->new_function_ptr_type(undef,
+         $void_ptr_type, [ $void_ptr_type, $void_ptr_type, $int_type ], 0);
+
+     my $sv_iv_type = $ctx->new_function_ptr_type(undef, 
+         $int_type, [ $void_ptr_type, $void_ptr_type ], 0);
+   #+END_src
+   #+BEGIN_NOTES
+   We also need a bunch of types for Ouroboros functions we're going to call. 
+   #+END_NOTES
+** Ex2: convert function pointers into GCCJIT values
+  #+BEGIN_src perl +n :tangle ex2.pl
+    my $stack_init_ptr = $ctx->new_rvalue_from_ptr(
+        $stack_op_type, 
+        ouroboros_stack_init_ptr);
+    my $stack_prepush_ptr = $ctx->new_rvalue_from_ptr(
+        $stack_op_type,
+        ouroboros_stack_prepush_ptr);
+    my $stack_putback_ptr = $ctx->new_rvalue_from_ptr(
+        $stack_op_type, 
+        ouroboros_stack_putback_ptr);
+    my $stack_fetch_ptr = $ctx->new_rvalue_from_ptr(
+        $stack_op_int_type, 
+        ouroboros_stack_fetch_ptr);
+    my $stack_xpush_iv_ptr = $ctx->new_rvalue_from_ptr(
+        $stack_op_int_type,
+        ouroboros_stack_xpush_iv_ptr);
+    my $sv_iv_ptr = $ctx->new_rvalue_from_ptr(
+        $sv_iv_type,
+        ouroboros_sv_iv_ptr);
+  #+END_src
+  #+BEGIN_NOTES
+  Then we convert memory addresses of Ouroboros functions into GCCJIT
+  values of corresponding function pointer types.
+  #+END_NOTES
+** Ex2: create our function
+  #+BEGIN_src perl +n :tangle ex2.pl
+    my $perl = $ctx->new_param(undef, $void_ptr_type, "perl");
+    my $cv = $ctx->new_param(undef, $void_ptr_type, "cv");
+
+    my $fn = $ctx->new_function(undef, GCC_JIT_FUNCTION_EXPORTED,
+        $void_type, "square", [ $perl, $cv ],
+        0);
+  #+END_src
+  #+BEGIN_NOTES
+  According to the XS calling convention, our function has to return
+  nothing and accept two parameters: pointer to the perl interpreter
+  and pointer to the CV.
+  #+END_NOTES
+** Ex2: create stack variable
+   #+BEGIN_src perl +n :tangle ex2.pl
+     my $stack = $fn->new_local(undef, $stack_type, "stack");
+     my $stack_ptr = $stack->get_address(undef);
+
+     my $perl_ptr = $perl->as_rvalue();
+     my $block = $fn->new_block("my block");
+
+     $block->add_eval(undef, $ctx->new_call_through_ptr(undef,
+         $stack_init_ptr, [ $perl_ptr, $stack_ptr ]));
+
+     my $param_sv = $ctx->new_call_through_ptr(undef,
+         $stack_fetch_ptr, [ $perl_ptr, $stack_ptr, $ctx->zero($int_type) ]);
+
+     my $param_int = $ctx->new_call_through_ptr(undef,
+         $sv_iv_ptr, [ $perl_ptr, $param_sv ]);
+   #+END_src
+   #+BEGIN_NOTES
+   We call =new_local= to create a variable of type stack, and
+   retrieve its address.  Then we call several Ouroboros functions
+   using =new_call_through_ptr= and pointer values created earlier:
+   =stack_init=, =stack_fetch= that retruns an SV pointer, and =sv_iv=
+   to get the integer value from the scalar.
+   #+END_NOTES
+** Ex2: multiply and return
+   #+BEGIN_src perl +n :tangle ex2.pl
+     my $rvalue = $ctx->new_binary_op(undef,
+         GCC_JIT_BINARY_OP_MULT,
+         $int_type, $param_int, $param_int);
+
+     $block->add_eval(undef, $ctx->new_call_through_ptr(undef,
+         $stack_prepush_ptr, [ $perl_ptr, $stack_ptr ]));
+
+     $block->add_eval(undef, $ctx->new_call_through_ptr(undef,
+         $stack_xpush_iv_ptr, [ $perl_ptr, $stack_ptr, $rvalue ]));
+
+     $block->add_eval(undef, $ctx->new_call_through_ptr(undef,
+         $stack_putback_ptr, [ $perl_ptr, $stack_ptr ]));
+
+     $block->end_with_void_return(undef);
+   #+END_src
+   #+BEGIN_NOTES
+   We multiply the integer same way as before and to return it we need
+   to push it onto the Perl stack. Again we call some ouroboros
+   functions that correspond to XS macros =prepush=, =mxpushi= and
+   =putback=.
+   #+END_NOTES
+** Ex2: compile and call
+   #+BEGIN_src perl +n :tangle ex2.pl
+     our $result = $ctx->compile;
+     my $ptr = $result->get_code("square");
+
+     use DynaLoader;
+     use feature "say";
+
+     my $xs = DynaLoader::dl_install_xsub("main::square", $ptr);
+
+     say square(4);
+   #+END_src
+   #+BEGIN_NOTES
+   We compile context and get the function address exactly the same
+   way as in the first example, but now we use DynaLoader to tell perl
+   that there is a callable function at that address.
+   #+END_NOTES
+   #+BEGIN_src perl +n :tangle ex2.pl :exports none
+     { no warnings; push @{$main::stash}, $result; $xs }
+   #+END_src
+* COMMENT Why not just use FFI
+  * No support for native Perl types
+  * FFI is sub-optimal
+* What to compile
+  #+ATTR_REVEAL: :frag (none none t)
+  * Perl based DSL
+  * Custom new syntax
+  * Perl
+  #+BEGIN_NOTES
+  This boilerplate can be hidden behind a DSL, but expressions would
+  still be cumbersome. Maybe I can make a parser for a simple language
+  and have expressions as strings.
+  
+  But our program is already parsed, can't I just take the expressions
+  from perl itself?
+  #+END_NOTES
+* Example 3
+  Compile expressions defined as Perl subroutines:
+  #+BEGIN_src perl -n :tangle ex3.pl
+    use strict;
+    use warnings;
+    use feature "say";
+    use Orr;
+
+    my $xs = Orr::compile(sub {
+        my $x = $_[0];
+        $x * $x
+    });
+
+    say $xs->(4);
+  #+END_src
+  #+BEGIN_NOTES
+  Orr takes a Perl codereference, analyzes its structure, and compiles
+  it to machine code using set of rules that are different from Perl.
+  It's a different language that uses Perl syntax and can be parsed by
+  perl.
+
+  It's an ongoing experiment: is there such a subset of Perl language
+  that can be efficiently compiled into machine code? Not to be 100%
+  compatibility - the interpreter is still there, no need to reinvent
+  it.
+  #+END_NOTES
+  #+BEGIN_src perl +n :tangle ex3.pl :exports none
+    {
+        no warnings;
+        $xs;
+    }
+  #+END_src
+* COMMENT Benchmark
+  #+BEGIN_src perl -n :tangle benchmark.pl
+    use strict;
+    use warnings;
+    use feature "say";
+    use Benchmark qw/timethese/;
+
+    my $iter = 10_000_000;
+
+    say "Require ex1.pl: hand crafted code called via FFI";
+    my $ex1 = require("ex1.pl");
+    say "Require ex2.pl: hand crafted code called via XS";
+    my $ex2 = require("ex2.pl");
+    say "Require ex3.pl: compiled using Orr"; 
+    my $ex3 = require("ex3.pl");
+
+    my $pp = sub { $_[0] * $_[0] };
+
+    timethese($iter, {
+        ex1 => sub { $ex1->(4) },
+        ex2 => sub { $ex2->(4) },
+        ex3 => sub { $ex3->(4) },
+        pure => sub { $pp->(4) },
+    });
+  #+END_src
+* COMMENT More about Orr
+** B::ExprTree
+** Type system
+** Challenges
+* That's it
+  https://github.com/vickenty/gccjit-perl
+
+  https://github.com/vickenty/ouroboros
+
+  https://github.com/vickenty/orr

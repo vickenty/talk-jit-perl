@@ -1,0 +1,10 @@
+{
+  "name": "perl-jit-talk",
+  "version": "0.0.0",
+  "description": "Slides for the Perl JIT talk",
+  "dependencies": {
+    "reveal.js": "^3.1.0"
+  },
+  "author": "Vikentiy Fesunov",
+  "license": "GFDL"
+}
